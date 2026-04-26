@@ -357,6 +357,17 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
     const chatWorkspace = resolvePath(workspaceRoot, String(chatId));
     await mkdir(chatWorkspace, { recursive: true });
 
+    const chatCustomTools = [...piCustomTools, ...createImageTools(chatId)];
+    // pi-mono treats `tools` as an allowlist that ALSO filters customTools.
+    // We must include every custom tool name here, otherwise pi-mono drops
+    // them from the registry and the LLM never sees their schemas.
+    const allowedToolNames = [
+      "read",
+      "write",
+      "edit",
+      ...chatCustomTools.map((t) => t.name)
+    ];
+
     const result = await createAgentSession({
       model: piModel,
       authStorage: piAuthStorage,
@@ -364,13 +375,16 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
       resourceLoader: piResourceLoader,
       sessionManager: SessionManager.inMemory(),
       settingsManager: SettingsManager.inMemory(),
-      customTools: [...piCustomTools, ...createImageTools(chatId)],
+      customTools: chatCustomTools,
       // Per-chat working directory for the read/write/edit tools.
       cwd: chatWorkspace,
-      // Allowlist of built-in tools. bash/grep/find/ls intentionally excluded.
-      tools: ["read", "write", "edit"]
+      // Allowlist: built-in read/write/edit + every custom tool.
+      // bash/grep/find/ls intentionally excluded.
+      tools: allowedToolNames
     });
     session = result.session;
+    const activeNames = session.getActiveToolNames();
+    console.log(`[pi:${chatId}] session ready, active tools (${activeNames.length}): ${activeNames.join(", ")}`);
     session.subscribe((event) => {
       // Log a compact, useful subset; ignore noisy per-token streaming events.
       switch (event.type) {
