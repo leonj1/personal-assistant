@@ -4,10 +4,19 @@ HOST_PORT ?= 3213
 CONTAINER_PORT ?= 3000
 ENV_FILE_ARGS := $(if $(wildcard .env),--env-file .env,)
 
-.PHONY: start stop restart
+.PHONY: build install image start stop restart clean
 
-start:
+build: node_modules
+	npm run build
+
+install node_modules: package.json package-lock.json
+	npm ci
+	@touch node_modules
+
+image:
 	docker build -t $(IMAGE_NAME) .
+
+start: image
 	@if docker ps -aq -f name=^/$(CONTAINER_NAME)$$ | grep -q .; then \
 		echo "Container $(CONTAINER_NAME) already exists. Run 'make restart' or 'make stop' first."; \
 		exit 1; \
@@ -24,3 +33,6 @@ stop:
 	fi
 
 restart: stop start
+
+clean:
+	rm -rf dist
