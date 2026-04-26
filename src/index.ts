@@ -1,5 +1,5 @@
 import { createServer, type ServerResponse } from "node:http";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
 import {
   AuthStorage,
@@ -62,9 +62,31 @@ const llmModelId = process.env.LLM_MODEL;
 const llmBaseUrl = process.env.LLM_BASE_URL;
 const llmApiKey = process.env.LLM_API_KEY;
 const workspaceRoot = resolvePath(process.env.WORKSPACE_ROOT ?? "./data/workspaces");
-const piSystemPrompt =
+const systemPromptPath = resolvePath(process.env.SYSTEM_PROMPT_PATH ?? "./prompts/SYSTEM.md");
+const fallbackSystemPrompt =
   `You are a helpful personal assistant replying to messages on Telegram. Keep responses concise and conversational. ` +
   `You have a per-chat scratch workspace where the read/write/edit tools operate; use it freely for drafts, notes, and intermediate files.`;
+let piSystemPrompt = fallbackSystemPrompt;
+
+async function loadSystemPrompt(): Promise<void> {
+  try {
+    const contents = await readFile(systemPromptPath, "utf8");
+    const trimmed = contents.trim();
+    if (!trimmed) {
+      console.warn(`System prompt at ${systemPromptPath} is empty; using built-in fallback.`);
+      return;
+    }
+    piSystemPrompt = trimmed;
+    console.log(`System prompt loaded from ${systemPromptPath} (${trimmed.length} chars).`);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      console.warn(`System prompt file not found at ${systemPromptPath}; using built-in fallback.`);
+    } else {
+      console.warn(`Failed to read system prompt from ${systemPromptPath}: ${(error as Error).message}. Using built-in fallback.`);
+    }
+  }
+}
 
 let nextTelegramUpdateId = 0;
 let isShuttingDown = false;
@@ -421,6 +443,7 @@ function chunkTelegramMessage(text: string): string[] {
 server.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
   void mkdir(workspaceRoot, { recursive: true })
+    .then(() => loadSystemPrompt())
     .then(() => initializePiMono())
     .then(() => {
       void startTelegramLongPolling();

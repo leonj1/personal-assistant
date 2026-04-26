@@ -21,6 +21,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
+COPY prompts ./prompts
 
 # Per-chat workspaces are written here at runtime; mount a volume to persist.
 RUN mkdir -p /app/data && chown -R node:node /app/data
