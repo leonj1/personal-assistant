@@ -17,6 +17,7 @@ import { createGithubTools } from "./tools/github.js";
 import { createVercelTools } from "./tools/vercel.js";
 import { createRailwayTools } from "./tools/railway.js";
 import { createTravelTools } from "./tools/travel.js";
+import { createDevboxerTools } from "./tools/devboxer.js";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 try {
@@ -329,7 +330,8 @@ async function initializePiMono(): Promise<void> {
     ...createGithubTools(),
     ...createVercelTools(),
     ...createRailwayTools(),
-    ...createTravelTools()
+    ...createTravelTools(),
+    ...createDevboxerTools()
   ];
   if (piCustomTools.length > 0) {
     console.log(`pi-mono custom tools enabled: ${piCustomTools.map((t) => t.name).join(", ")}`);
