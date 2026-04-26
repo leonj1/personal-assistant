@@ -14,6 +14,8 @@ import {
 import { createWebTools } from "./tools/web.js";
 import { createImageTools } from "./tools/image.js";
 import { createGithubTools } from "./tools/github.js";
+import { createVercelTools } from "./tools/vercel.js";
+import { createRailwayTools } from "./tools/railway.js";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 try {
@@ -301,7 +303,12 @@ async function initializePiMono(): Promise<void> {
   });
   await piResourceLoader.reload();
 
-  piCustomTools = [...createWebTools(), ...createGithubTools()];
+  piCustomTools = [
+    ...createWebTools(),
+    ...createGithubTools(),
+    ...createVercelTools(),
+    ...createRailwayTools()
+  ];
   if (piCustomTools.length > 0) {
     console.log(`pi-mono custom tools enabled: ${piCustomTools.map((t) => t.name).join(", ")}`);
   }
