@@ -1,6 +1,6 @@
 IMAGE_NAME ?= myclaw:local
 CONTAINER_NAME ?= myclaw-app
-HOST_PORT ?= 3000
+HOST_PORT ?= 3213
 CONTAINER_PORT ?= 3000
 ENV_FILE_ARGS := $(if $(wildcard .env),--env-file .env,)
 

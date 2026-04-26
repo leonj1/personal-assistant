@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 
 type TelegramMessage = {
   chat?: {
@@ -18,11 +18,21 @@ type TelegramUpdate = {
   inline_query?: TelegramInlineQuery;
 };
 
+type TelegramApiResponse<Result> = {
+  ok: boolean;
+  result: Result;
+  description?: string;
+};
+
 const port = Number(process.env.PORT ?? 3000);
-const telegramWebhookPath = process.env.TELEGRAM_WEBHOOK_PATH ?? "/telegram/webhook";
-const telegramWebhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
-const telegramEchoMessages = process.env.TELEGRAM_ECHO_MESSAGES === "true";
+const telegramTypingDelayMs = 1200;
+const telegramPollTimeoutSeconds = Number(process.env.TELEGRAM_POLL_TIMEOUT_SECONDS ?? 30);
+const telegramPollRetryDelayMs = Number(process.env.TELEGRAM_POLL_RETRY_DELAY_MS ?? 1000);
+
+let nextTelegramUpdateId = 0;
+let isShuttingDown = false;
+const telegramPollAbortController = new AbortController();
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -31,25 +41,13 @@ function sendJson(response: ServerResponse, statusCode: number, payload: unknown
   response.end(JSON.stringify(payload));
 }
 
-async function readJsonBody(request: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-
-  for await (const chunk of request) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-  }
-
-  const rawBody = Buffer.concat(chunks).toString("utf8");
-
-  if (!rawBody) {
-    return {};
-  }
-
-  return JSON.parse(rawBody) as unknown;
-}
-
-async function callTelegramApi(method: string, payload: Record<string, unknown>): Promise<void> {
+async function callTelegramApi<Result>(
+  method: string,
+  payload: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<Result> {
   if (!telegramBotToken) {
-    return;
+    throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
   }
 
   const response = await fetch(`https://api.telegram.org/bot${telegramBotToken}/${method}`, {
@@ -57,13 +55,24 @@ async function callTelegramApi(method: string, payload: Record<string, unknown>)
     headers: {
       "Content-Type": "application/json; charset=utf-8"
     },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
+    signal
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Telegram API ${method} failed: ${response.status} ${errorText}`);
+  const responseBody = (await response.json()) as TelegramApiResponse<Result>;
+
+  if (!response.ok || !responseBody.ok) {
+    const description = responseBody.description ?? response.statusText;
+    throw new Error(`Telegram API ${method} failed: ${response.status} ${description}`);
   }
+
+  return responseBody.result;
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
 }
 
 async function handleTelegramUpdate(update: TelegramUpdate): Promise<void> {
@@ -79,10 +88,17 @@ async function handleTelegramUpdate(update: TelegramUpdate): Promise<void> {
       text: messageText
     });
 
-    if (telegramEchoMessages && chatId && telegramBotToken) {
+    if (chatId && telegramBotToken) {
+      await callTelegramApi("sendChatAction", {
+        chat_id: chatId,
+        action: "typing"
+      });
+
+      await sleep(telegramTypingDelayMs);
+
       await callTelegramApi("sendMessage", {
         chat_id: chatId,
-        text: `Received: ${messageText}`
+        text: "hello"
       });
     }
   }
@@ -114,6 +130,53 @@ async function handleTelegramUpdate(update: TelegramUpdate): Promise<void> {
   }
 }
 
+async function startTelegramLongPolling(): Promise<void> {
+  if (!telegramBotToken) {
+    console.log("TELEGRAM_BOT_TOKEN is not configured. Telegram polling is disabled.");
+    return;
+  }
+
+  let webhookCleared = false;
+
+  while (!isShuttingDown) {
+    try {
+      if (!webhookCleared) {
+        await callTelegramApi("deleteWebhook", {
+          drop_pending_updates: false
+        });
+
+        webhookCleared = true;
+        console.log("Telegram long polling started");
+      }
+
+      const updates = await callTelegramApi<TelegramUpdate[]>(
+        "getUpdates",
+        {
+          offset: nextTelegramUpdateId,
+          timeout: telegramPollTimeoutSeconds,
+          allowed_updates: ["message", "inline_query"]
+        },
+        telegramPollAbortController.signal
+      );
+
+      for (const update of updates) {
+        if (typeof update.update_id === "number") {
+          nextTelegramUpdateId = update.update_id + 1;
+        }
+
+        await handleTelegramUpdate(update);
+      }
+    } catch (error) {
+      if (telegramPollAbortController.signal.aborted) {
+        break;
+      }
+
+      console.error("Telegram long polling failed", error);
+      await sleep(telegramPollRetryDelayMs);
+    }
+  }
+}
+
 const server = createServer(async (request, response) => {
   const method = request.method ?? "GET";
   const parsedUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
@@ -121,21 +184,6 @@ const server = createServer(async (request, response) => {
   try {
     if (method === "GET" && parsedUrl.pathname === "/health") {
       sendJson(response, 200, { status: "ok" });
-      return;
-    }
-
-    if (method === "POST" && parsedUrl.pathname === telegramWebhookPath) {
-      if (
-        telegramWebhookSecret &&
-        request.headers["x-telegram-bot-api-secret-token"] !== telegramWebhookSecret
-      ) {
-        sendJson(response, 401, { error: "Unauthorized" });
-        return;
-      }
-
-      const body = await readJsonBody(request);
-      await handleTelegramUpdate(body as TelegramUpdate);
-      sendJson(response, 200, { ok: true });
       return;
     }
 
@@ -148,5 +196,13 @@ const server = createServer(async (request, response) => {
 
 server.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
-  console.log(`Telegram webhook endpoint available at ${telegramWebhookPath}`);
+  void startTelegramLongPolling();
 });
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => {
+    isShuttingDown = true;
+    telegramPollAbortController.abort();
+    server.close();
+  });
+}
