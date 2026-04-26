@@ -12,6 +12,7 @@ import {
   type ToolDefinition
 } from "@mariozechner/pi-coding-agent";
 import { createWebTools } from "./tools/web.js";
+import { createImageTools } from "./tools/image.js";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 try {
@@ -304,6 +305,15 @@ async function initializePiMono(): Promise<void> {
     console.log(`pi-mono custom tools enabled: ${piCustomTools.map((t) => t.name).join(", ")}`);
   }
 
+  // Image tools are constructed per-chat (need chatId) but we probe here so the
+  // log line at startup tells the operator whether they will be available.
+  const imageProbe = createImageTools(0);
+  if (imageProbe.length > 0) {
+    console.log(`pi-mono per-chat tools enabled: ${imageProbe.map((t) => t.name).join(", ")}`);
+  } else if (!process.env.OPENAI_IMAGE_API_KEY && !process.env.OPENAI_API_KEY) {
+    console.log("OPENAI_API_KEY/OPENAI_IMAGE_API_KEY not set; generate_image tool disabled.");
+  }
+
   console.log(`pi-mono ready (provider=${llmProvider}, model=${llmModelId})`);
 }
 
@@ -324,7 +334,7 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
       resourceLoader: piResourceLoader,
       sessionManager: SessionManager.inMemory(),
       settingsManager: SettingsManager.inMemory(),
-      customTools: piCustomTools,
+      customTools: [...piCustomTools, ...createImageTools(chatId)],
       // Per-chat working directory for the read/write/edit tools.
       cwd: chatWorkspace,
       // Allowlist of built-in tools. bash/grep/find/ls intentionally excluded.
