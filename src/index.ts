@@ -63,29 +63,27 @@ const llmBaseUrl = process.env.LLM_BASE_URL;
 const llmApiKey = process.env.LLM_API_KEY;
 const workspaceRoot = resolvePath(process.env.WORKSPACE_ROOT ?? "./data/workspaces");
 const systemPromptPath = resolvePath(process.env.SYSTEM_PROMPT_PATH ?? "./prompts/SYSTEM.md");
-const fallbackSystemPrompt =
-  `You are a helpful personal assistant replying to messages on Telegram. Keep responses concise and conversational. ` +
-  `You have a per-chat scratch workspace where the read/write/edit tools operate; use it freely for drafts, notes, and intermediate files.`;
-let piSystemPrompt = fallbackSystemPrompt;
+let piSystemPrompt = "";
 
 async function loadSystemPrompt(): Promise<void> {
+  let contents: string;
   try {
-    const contents = await readFile(systemPromptPath, "utf8");
-    const trimmed = contents.trim();
-    if (!trimmed) {
-      console.warn(`System prompt at ${systemPromptPath} is empty; using built-in fallback.`);
-      return;
-    }
-    piSystemPrompt = trimmed;
-    console.log(`System prompt loaded from ${systemPromptPath} (${trimmed.length} chars).`);
+    contents = await readFile(systemPromptPath, "utf8");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
-      console.warn(`System prompt file not found at ${systemPromptPath}; using built-in fallback.`);
-    } else {
-      console.warn(`Failed to read system prompt from ${systemPromptPath}: ${(error as Error).message}. Using built-in fallback.`);
+      throw new Error(`System prompt file not found at ${systemPromptPath}.`);
     }
+    throw new Error(
+      `Failed to read system prompt from ${systemPromptPath}: ${(error as Error).message}`
+    );
   }
+  const trimmed = contents.trim();
+  if (!trimmed) {
+    throw new Error(`System prompt at ${systemPromptPath} is empty.`);
+  }
+  piSystemPrompt = trimmed;
+  console.log(`System prompt loaded from ${systemPromptPath} (${trimmed.length} chars).`);
 }
 
 let nextTelegramUpdateId = 0;
@@ -447,6 +445,10 @@ server.listen(port, () => {
     .then(() => initializePiMono())
     .then(() => {
       void startTelegramLongPolling();
+    })
+    .catch((error: unknown) => {
+      console.error(`Startup failed: ${(error as Error).message}`);
+      process.exit(1);
     });
 });
 
