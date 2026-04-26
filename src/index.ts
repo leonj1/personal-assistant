@@ -1,4 +1,22 @@
 import { createServer, type ServerResponse } from "node:http";
+import {
+  AuthStorage,
+  createAgentSession,
+  DefaultResourceLoader,
+  getAgentDir,
+  ModelRegistry,
+  SessionManager,
+  SettingsManager
+} from "@mariozechner/pi-coding-agent";
+import type { Api, Model } from "@mariozechner/pi-ai";
+
+try {
+  process.loadEnvFile(".env");
+} catch {
+  // No .env file present (or it was already loaded via --env-file). Ignore.
+}
+
+type AgentSession = Awaited<ReturnType<typeof createAgentSession>>["session"];
 
 type TelegramMessage = {
   chat?: {
@@ -26,13 +44,27 @@ type TelegramApiResponse<Result> = {
 
 const port = Number(process.env.PORT ?? 3000);
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
-const telegramTypingDelayMs = 1200;
 const telegramPollTimeoutSeconds = Number(process.env.TELEGRAM_POLL_TIMEOUT_SECONDS ?? 30);
 const telegramPollRetryDelayMs = Number(process.env.TELEGRAM_POLL_RETRY_DELAY_MS ?? 1000);
+const telegramMaxMessageChars = 4000;
+
+const llmProvider = process.env.LLM_PROVIDER;
+const llmModelId = process.env.LLM_MODEL;
+const llmBaseUrl = process.env.LLM_BASE_URL;
+const llmApiKey = process.env.LLM_API_KEY;
+const piSystemPrompt =
+  "You are a helpful personal assistant replying to messages on Telegram. Keep responses concise and conversational.";
 
 let nextTelegramUpdateId = 0;
 let isShuttingDown = false;
 const telegramPollAbortController = new AbortController();
+
+const piSessions = new Map<number, AgentSession>();
+let piAuthStorage: AuthStorage | undefined;
+let piModelRegistry: ModelRegistry | undefined;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let piModel: Model<any> | undefined;
+let piResourceLoader: DefaultResourceLoader | undefined;
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -94,12 +126,20 @@ async function handleTelegramUpdate(update: TelegramUpdate): Promise<void> {
         action: "typing"
       });
 
-      await sleep(telegramTypingDelayMs);
+      let replyText: string;
+      try {
+        replyText = await generateAssistantReply(chatId, messageText);
+      } catch (error) {
+        console.error("Assistant reply failed", error);
+        replyText = "Sorry, I hit an error trying to answer that.";
+      }
 
-      await callTelegramApi("sendMessage", {
-        chat_id: chatId,
-        text: "hello"
-      });
+      for (const chunk of chunkTelegramMessage(replyText)) {
+        await callTelegramApi("sendMessage", {
+          chat_id: chatId,
+          text: chunk
+        });
+      }
     }
   }
 
@@ -194,15 +234,166 @@ const server = createServer(async (request, response) => {
   }
 });
 
+async function initializePiMono(): Promise<void> {
+  if (!llmProvider || !llmModelId) {
+    console.log(
+      "LLM_PROVIDER or LLM_MODEL is not configured. The bot will reply with a static fallback message."
+    );
+    return;
+  }
+
+  piAuthStorage = AuthStorage.create();
+  piModelRegistry = ModelRegistry.create(piAuthStorage);
+
+  if (llmBaseUrl) {
+    if (!llmApiKey) {
+      console.error(
+        "LLM_BASE_URL is set but LLM_API_KEY is missing. Custom OpenAI-compatible provider needs both."
+      );
+      return;
+    }
+
+    piModelRegistry.registerProvider(llmProvider, {
+      baseUrl: llmBaseUrl,
+      apiKey: llmApiKey,
+      api: "openai-completions" satisfies Api,
+      authHeader: true,
+      models: [
+        {
+          id: llmModelId,
+          name: llmModelId,
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 128000,
+          maxTokens: 16384
+        }
+      ]
+    });
+
+    console.log(
+      `pi-mono custom provider registered: ${llmProvider} -> ${llmBaseUrl} (model=${llmModelId})`
+    );
+  }
+
+  const model = piModelRegistry.find(llmProvider, llmModelId);
+  if (!model) {
+    console.error(
+      `pi-mono model not found: provider='${llmProvider}', model='${llmModelId}'. Bot will reply with a static fallback message.`
+    );
+    return;
+  }
+
+  piModel = model;
+  piResourceLoader = new DefaultResourceLoader({
+    cwd: process.cwd(),
+    agentDir: getAgentDir(),
+    systemPrompt: piSystemPrompt
+  });
+  await piResourceLoader.reload();
+
+  console.log(`pi-mono ready (provider=${llmProvider}, model=${llmModelId})`);
+}
+
+async function getOrCreatePiSession(chatId: number): Promise<AgentSession | undefined> {
+  if (!piModel || !piAuthStorage || !piModelRegistry || !piResourceLoader) {
+    return undefined;
+  }
+
+  let session = piSessions.get(chatId);
+  if (!session) {
+    const result = await createAgentSession({
+      model: piModel,
+      authStorage: piAuthStorage,
+      modelRegistry: piModelRegistry,
+      resourceLoader: piResourceLoader,
+      sessionManager: SessionManager.inMemory(),
+      settingsManager: SettingsManager.inMemory(),
+      noTools: "all"
+    });
+    session = result.session;
+    session.subscribe((event) => {
+      // Log a compact, useful subset; ignore noisy per-token streaming events.
+      switch (event.type) {
+        case "agent_start":
+        case "agent_end":
+        case "turn_start":
+        case "message_start":
+        case "compaction_start":
+        case "compaction_end":
+        case "auto_retry_start":
+        case "auto_retry_end":
+          console.log(`[pi:${chatId}] ${event.type}`);
+          break;
+        case "message_end": {
+          const msg = event.message;
+          if (msg.role === "assistant") {
+            const stop = msg.stopReason;
+            console.log(
+              `[pi:${chatId}] message_end role=assistant stop=${stop ?? "ok"}` +
+                (msg.errorMessage ? ` err=${msg.errorMessage}` : "")
+            );
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    });
+    piSessions.set(chatId, session);
+  }
+
+  return session;
+}
+
+async function generateAssistantReply(chatId: number, text: string): Promise<string> {
+  const session = await getOrCreatePiSession(chatId);
+  if (!session) {
+    return "hello";
+  }
+
+  await session.prompt(text);
+
+  // pi-mono reports LLM errors on the last assistant message rather than throwing.
+  const messages = session.messages;
+  const last = messages[messages.length - 1];
+  if (last && last.role === "assistant") {
+    if (last.stopReason === "error" || last.stopReason === "aborted") {
+      throw new Error(last.errorMessage ?? `Request ${last.stopReason}`);
+    }
+  }
+
+  return session.getLastAssistantText()?.trim() || "(no response)";
+}
+
+function chunkTelegramMessage(text: string): string[] {
+  if (text.length <= telegramMaxMessageChars) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  for (let index = 0; index < text.length; index += telegramMaxMessageChars) {
+    chunks.push(text.slice(index, index + telegramMaxMessageChars));
+  }
+
+  return chunks;
+}
+
 server.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
-  void startTelegramLongPolling();
+  void initializePiMono().then(() => {
+    void startTelegramLongPolling();
+  });
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     isShuttingDown = true;
     telegramPollAbortController.abort();
+    for (const session of piSessions.values()) {
+      session.dispose();
+    }
+    piSessions.clear();
     server.close();
   });
 }
