@@ -1,4 +1,6 @@
 import { createServer, type ServerResponse } from "node:http";
+import { mkdir } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 import {
   AuthStorage,
   createAgentSession,
@@ -54,8 +56,10 @@ const llmProvider = process.env.LLM_PROVIDER;
 const llmModelId = process.env.LLM_MODEL;
 const llmBaseUrl = process.env.LLM_BASE_URL;
 const llmApiKey = process.env.LLM_API_KEY;
+const workspaceRoot = resolvePath(process.env.WORKSPACE_ROOT ?? "./data/workspaces");
 const piSystemPrompt =
-  "You are a helpful personal assistant replying to messages on Telegram. Keep responses concise and conversational.";
+  `You are a helpful personal assistant replying to messages on Telegram. Keep responses concise and conversational. ` +
+  `You have a per-chat scratch workspace where the read/write/edit tools operate; use it freely for drafts, notes, and intermediate files.`;
 
 let nextTelegramUpdateId = 0;
 let isShuttingDown = false;
@@ -310,6 +314,9 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
 
   let session = piSessions.get(chatId);
   if (!session) {
+    const chatWorkspace = resolvePath(workspaceRoot, String(chatId));
+    await mkdir(chatWorkspace, { recursive: true });
+
     const result = await createAgentSession({
       model: piModel,
       authStorage: piAuthStorage,
@@ -318,8 +325,10 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
       sessionManager: SessionManager.inMemory(),
       settingsManager: SettingsManager.inMemory(),
       customTools: piCustomTools,
-      // Disable built-in coding tools (read/write/edit/bash) for now; custom tools stay enabled.
-      noTools: "builtin"
+      // Per-chat working directory for the read/write/edit tools.
+      cwd: chatWorkspace,
+      // Allowlist of built-in tools. bash/grep/find/ls intentionally excluded.
+      tools: ["read", "write", "edit"]
     });
     session = result.session;
     session.subscribe((event) => {
@@ -391,9 +400,11 @@ function chunkTelegramMessage(text: string): string[] {
 
 server.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
-  void initializePiMono().then(() => {
-    void startTelegramLongPolling();
-  });
+  void mkdir(workspaceRoot, { recursive: true })
+    .then(() => initializePiMono())
+    .then(() => {
+      void startTelegramLongPolling();
+    });
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

@@ -22,6 +22,10 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
 
+# Per-chat workspaces are written here at runtime; mount a volume to persist.
+RUN mkdir -p /app/data && chown -R node:node /app/data
+VOLUME ["/app/data"]
+
 EXPOSE 3000
 
 USER node
