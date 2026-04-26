@@ -6,8 +6,10 @@ import {
   getAgentDir,
   ModelRegistry,
   SessionManager,
-  SettingsManager
+  SettingsManager,
+  type ToolDefinition
 } from "@mariozechner/pi-coding-agent";
+import { createWebTools } from "./tools/web.js";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 try {
@@ -65,6 +67,7 @@ let piModelRegistry: ModelRegistry | undefined;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let piModel: Model<any> | undefined;
 let piResourceLoader: DefaultResourceLoader | undefined;
+let piCustomTools: ToolDefinition[] = [];
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -292,6 +295,11 @@ async function initializePiMono(): Promise<void> {
   });
   await piResourceLoader.reload();
 
+  piCustomTools = [...createWebTools()];
+  if (piCustomTools.length > 0) {
+    console.log(`pi-mono custom tools enabled: ${piCustomTools.map((t) => t.name).join(", ")}`);
+  }
+
   console.log(`pi-mono ready (provider=${llmProvider}, model=${llmModelId})`);
 }
 
@@ -309,7 +317,9 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
       resourceLoader: piResourceLoader,
       sessionManager: SessionManager.inMemory(),
       settingsManager: SettingsManager.inMemory(),
-      noTools: "all"
+      customTools: piCustomTools,
+      // Disable built-in coding tools (read/write/edit/bash) for now; custom tools stay enabled.
+      noTools: "builtin"
     });
     session = result.session;
     session.subscribe((event) => {
