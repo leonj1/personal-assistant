@@ -1,4 +1,4 @@
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type ServerResponse, type IncomingMessage } from "node:http";
 import { mkdir, readFile } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
 import {
@@ -18,6 +18,10 @@ import { createVercelTools } from "./tools/vercel.js";
 import { createRailwayTools } from "./tools/railway.js";
 import { createTravelTools } from "./tools/travel.js";
 import { createDevboxerTools } from "./tools/devboxer.js";
+import { createMissionTools } from "./tools/missions.js";
+import { createStaffTools } from "./tools/staff.js";
+import { MissionsClient, type Staff } from "./missions.js";
+import { runStaffSession } from "./staffSession.js";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
 try {
@@ -64,6 +68,13 @@ const llmBaseUrl = process.env.LLM_BASE_URL;
 const llmApiKey = process.env.LLM_API_KEY;
 const workspaceRoot = resolvePath(process.env.WORKSPACE_ROOT ?? "./data/workspaces");
 const systemPromptPath = resolvePath(process.env.SYSTEM_PROMPT_PATH ?? "./prompts/SYSTEM.md");
+const missionsApiUrl = process.env.MISSIONS_API_URL?.trim();
+const messengerInboundToken = process.env.MESSENGER_INBOUND_TOKEN?.trim();
+const defaultTelegramChatIdRaw = process.env.DEFAULT_TELEGRAM_CHAT_ID?.trim();
+const defaultTelegramChatId =
+  defaultTelegramChatIdRaw && /^-?\d+$/.test(defaultTelegramChatIdRaw)
+    ? Number(defaultTelegramChatIdRaw)
+    : undefined;
 let piSystemPrompt = "";
 
 async function loadSystemPrompt(): Promise<void> {
@@ -98,6 +109,11 @@ let piModelRegistry: ModelRegistry | undefined;
 let piModel: Model<any> | undefined;
 let piResourceLoader: DefaultResourceLoader | undefined;
 let piCustomTools: ToolDefinition[] = [];
+// Custom tools the staff sub-agent inherits. Excludes the staff_* tools
+// (no recursion) but includes everything else, so a travel-agent staff
+// can call web_search/flight_search/mission_create_task etc.
+let piStaffSubagentTools: ToolDefinition[] = [];
+let missionsClient: MissionsClient | undefined;
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -260,12 +276,216 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (method === "POST" && parsedUrl.pathname === "/messenger/dispatch") {
+      await handleMessengerDispatch(request, response);
+      return;
+    }
+
     sendJson(response, 404, { error: "Not Found" });
   } catch (error) {
     console.error("Request handling failed", error);
     sendJson(response, 500, { error: "Internal Server Error" });
   }
 });
+
+// ---- Messenger inbound (from personal-assistant-watcher) ----
+
+type MessengerResolution =
+  | "staff"
+  | "fallback_no_assignment"
+  | "fallback_staff_deleted"
+  | "fallback_lookup_failed";
+
+type MessengerDispatchPayload = {
+  event?: {
+    id?: string;
+    event_type?: string;
+    source_id?: string;
+    project_id?: string;
+    purpose_id?: string;
+    summary?: string;
+    details?: string;
+    emitted_by?: string;
+    occurred_at?: string;
+  };
+  topic?: string;
+  entity_kind?: "task" | "project";
+  resolution?: MessengerResolution;
+  task?: Record<string, unknown>;
+  project?: Record<string, unknown>;
+  staff?: Staff;
+};
+
+async function readJsonBody(request: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : (chunk as Buffer));
+  }
+  const raw = Buffer.concat(chunks).toString("utf8");
+  if (!raw) return {};
+  return JSON.parse(raw);
+}
+
+function authorizeMessenger(request: IncomingMessage): boolean {
+  if (!messengerInboundToken) return true;
+  const header = request.headers.authorization ?? "";
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match !== null && match[1].trim() === messengerInboundToken;
+}
+
+async function handleMessengerDispatch(
+  request: IncomingMessage,
+  response: ServerResponse
+): Promise<void> {
+  if (!authorizeMessenger(request)) {
+    sendJson(response, 401, { error: "Unauthorized" });
+    return;
+  }
+
+  let payload: MessengerDispatchPayload;
+  try {
+    payload = (await readJsonBody(request)) as MessengerDispatchPayload;
+  } catch (error) {
+    sendJson(response, 400, { error: `Invalid JSON: ${(error as Error).message}` });
+    return;
+  }
+
+  const event = payload.event;
+  const resolution = payload.resolution;
+  if (!event || !resolution) {
+    sendJson(response, 400, { error: "event and resolution are required" });
+    return;
+  }
+
+  console.log("Messenger dispatch received", {
+    event_id: event.id,
+    event_type: event.event_type,
+    topic: payload.topic,
+    entity_kind: payload.entity_kind,
+    resolution,
+    staff_id: payload.staff?.id
+  });
+
+  // Acknowledge fast; the actual handling runs out-of-band so the watcher's
+  // consumer loop is not blocked by an LLM round-trip.
+  sendJson(response, 202, { accepted: true });
+
+  void processMessengerDispatch(payload).catch((error) => {
+    console.error("Messenger dispatch processing failed", error);
+  });
+}
+
+async function processMessengerDispatch(payload: MessengerDispatchPayload): Promise<void> {
+  const event = payload.event!;
+  const resolution = payload.resolution!;
+  const summary = describeEvent(payload);
+
+  if (resolution === "staff" && payload.staff) {
+    if (!piModel) {
+      console.warn("Messenger 'staff' dispatch arrived but pi-mono is not initialized; dropping.");
+      return;
+    }
+    try {
+      const result = await runStaffSession(payload.staff, summary, {
+        model: piModel,
+        authStorage: piAuthStorage!,
+        modelRegistry: piModelRegistry!,
+        staffTools: piStaffSubagentTools,
+        workspaceRoot
+      });
+      await deliverAutonomousMessage(
+        `[${result.staff.name} (${result.staff.area_of_focus})]\n${result.text}`
+      );
+    } catch (error) {
+      console.error("Staff session failed for messenger dispatch", error);
+      await deliverAutonomousMessage(
+        `Staff ${payload.staff.name} could not handle the event: ${(error as Error).message}`
+      );
+    }
+    return;
+  }
+
+  // All fallback resolutions go to the user's main chat session, where the
+  // LLM has staff_list / staff_create / staff_delegate available and can
+  // decide whether to mint a new staff or handle the request directly.
+  if (defaultTelegramChatId === undefined) {
+    console.warn(
+      "Messenger fallback received but DEFAULT_TELEGRAM_CHAT_ID is not set; dropping.",
+      { resolution, event_id: event.id }
+    );
+    return;
+  }
+
+  const fallbackPrompt = composeFallbackPrompt(payload);
+  try {
+    const reply = await generateAssistantReply(defaultTelegramChatId, fallbackPrompt);
+    for (const chunk of chunkTelegramMessage(reply)) {
+      await callTelegramApi("sendMessage", {
+        chat_id: defaultTelegramChatId,
+        text: chunk
+      });
+    }
+  } catch (error) {
+    console.error("Messenger fallback reply failed", error);
+  }
+}
+
+function describeEvent(payload: MessengerDispatchPayload): string {
+  const event = payload.event!;
+  const lines: string[] = [];
+  lines.push(`event_type=${event.event_type ?? "?"}`);
+  lines.push(`entity_kind=${payload.entity_kind ?? "?"}`);
+  lines.push(`source_id=${event.source_id ?? "?"}`);
+  if (event.project_id) lines.push(`project_id=${event.project_id}`);
+  if (event.purpose_id) lines.push(`purpose_id=${event.purpose_id}`);
+  if (event.emitted_by) lines.push(`emitted_by=${event.emitted_by}`);
+  if (event.occurred_at) lines.push(`occurred_at=${event.occurred_at}`);
+  const summary = (event.summary ?? "").trim();
+  const details = (event.details ?? "").trim();
+  const head = lines.join(", ");
+  return [
+    head,
+    summary ? `\nSummary: ${summary}` : "",
+    details ? `\nDetails: ${details}` : ""
+  ]
+    .join("")
+    .trim();
+}
+
+function composeFallbackPrompt(payload: MessengerDispatchPayload): string {
+  const reason =
+    payload.resolution === "fallback_no_assignment"
+      ? "No staff member is assigned to this event."
+      : payload.resolution === "fallback_staff_deleted"
+        ? "The previously assigned staff member no longer exists."
+        : "The watcher could not look up the assigned staff member.";
+
+  return (
+    `An autonomous event arrived from the watcher and needs handling.\n` +
+    `${reason} Decide whether to mint a new staff member (staff_create) and delegate ` +
+    `(staff_delegate), or handle the request yourself. If you choose to delegate, list ` +
+    `existing staff first via staff_list to avoid duplicates.\n\n` +
+    `--- Event ---\n` +
+    describeEvent(payload)
+  );
+}
+
+async function deliverAutonomousMessage(text: string): Promise<void> {
+  if (defaultTelegramChatId === undefined) {
+    console.log("Autonomous message dropped (no DEFAULT_TELEGRAM_CHAT_ID):", text);
+    return;
+  }
+  if (!telegramBotToken) {
+    console.log("Autonomous message dropped (no TELEGRAM_BOT_TOKEN):", text);
+    return;
+  }
+  for (const chunk of chunkTelegramMessage(text)) {
+    await callTelegramApi("sendMessage", {
+      chat_id: defaultTelegramChatId,
+      text: chunk
+    });
+  }
+}
 
 async function initializePiMono(): Promise<void> {
   if (!llmProvider || !llmModelId) {
@@ -325,13 +545,42 @@ async function initializePiMono(): Promise<void> {
   });
   await piResourceLoader.reload();
 
-  piCustomTools = [
+  if (missionsApiUrl) {
+    missionsClient = new MissionsClient(missionsApiUrl);
+    console.log(`Missions API client configured: ${missionsApiUrl}`);
+  } else {
+    console.log("MISSIONS_API_URL not set; staff_* and mission_* tools disabled.");
+  }
+
+  // Tools the staff sub-agent gets when delegated to. Built first so the
+  // staff_delegate runner closes over a stable list without seeing its
+  // own staff_* tools (would cause delegation recursion).
+  piStaffSubagentTools = [
     ...createWebTools(),
     ...createGithubTools(),
     ...createVercelTools(),
     ...createRailwayTools(),
     ...createTravelTools(),
-    ...createDevboxerTools()
+    ...createDevboxerTools(),
+    ...createMissionTools(missionsClient)
+  ];
+
+  const staffDelegateRunner = piModel
+    ? async (staff: Staff, request: string): Promise<string> => {
+        const result = await runStaffSession(staff, request, {
+          model: piModel!,
+          authStorage: piAuthStorage!,
+          modelRegistry: piModelRegistry!,
+          staffTools: piStaffSubagentTools,
+          workspaceRoot
+        });
+        return result.text;
+      }
+    : undefined;
+
+  piCustomTools = [
+    ...piStaffSubagentTools,
+    ...createStaffTools(missionsClient, staffDelegateRunner)
   ];
   if (piCustomTools.length > 0) {
     console.log(`pi-mono custom tools enabled: ${piCustomTools.map((t) => t.name).join(", ")}`);

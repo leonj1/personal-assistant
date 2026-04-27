@@ -57,6 +57,8 @@ Each tool auto-enables when its prerequisite env var is set; otherwise it's sile
 | `railway_list_projects` / `_get_project` | `RAILWAY_API_TOKEN` |
 | `flight_search` / `hotel_search` (SerpAPI Google Flights/Hotels) | `SERPAPI_API_KEY` |
 | `devboxer_create` / `_list` / `_pull` | `devboxer` CLI on `PATH` |
+| `mission_create_mission` / `_create_project` / `_create_task` | `MISSIONS_API_URL` |
+| `staff_list` / `staff_create` / `staff_delegate` | `MISSIONS_API_URL` |
 
 `bash`, `grep`, `find`, `ls` are intentionally **disabled** — only `read`/`write`/`edit` from pi-mono's built-ins, scoped to `data/workspaces/<chatId>/` so chats can't see each other's files.
 
@@ -81,8 +83,24 @@ The first `pi-mono custom tools enabled` line lists what was registered globally
 | `make stop` / `make restart` | obvious |
 | `make clean` | removes `dist/` |
 
-## Caveats
+## Staff & autonomous events
 
+When `MISSIONS_API_URL` is set, the bot becomes the human-facing entrypoint to a wider system of "staff" — singleton agents stored in [`personal-assistant-missions`](../personal-assistant-missions), each with a persisted `system_prompt` and a unique `area_of_focus` (e.g. `travel`, `revenue`).
+
+- **`staff_list`** – check whether the right staff already exists.
+- **`staff_create`** – mint a new staff member when none covers the area you need (`area_of_focus` is unique).
+- **`staff_delegate`** – run a one-shot, ephemeral pi-mono session as the named staff. The sub-agent inherits every custom tool *except* `staff_*` (no recursion) and is told via system preamble to break the request into a project + sub-tasks (`mission_create_project`, `mission_create_task`) when warranted.
+
+The bot also exposes **`POST /messenger/dispatch`** for [`personal-assistant-watcher`](../personal-assistant-watcher)'s messenger to push Kafka events back into the bot. The handler responds `202 Accepted` immediately and processes asynchronously:
+
+| `resolution` (from watcher) | What the bot does |
+| --- | --- |
+| `staff` | Spawns an ephemeral session with `payload.staff.system_prompt` and posts the staff's reply to `DEFAULT_TELEGRAM_CHAT_ID`. |
+| `fallback_no_assignment` / `fallback_staff_deleted` / `fallback_lookup_failed` | Injects a synthesized prompt into the user's main chat session ("an autonomous event arrived; decide whether to mint a staff or handle directly") so the LLM can use `staff_list` / `staff_create` / `staff_delegate` interactively. |
+
+If `MESSENGER_INBOUND_TOKEN` is set, the route requires `Authorization: Bearer <token>`. If `DEFAULT_TELEGRAM_CHAT_ID` is unset, autonomous deliveries are logged and dropped.
+
+## Caveats
 - **Multi-tenant safety.** The bot has `read`/`write`/`edit` tools and APIs to GitHub, Vercel, Railway, OpenAI, etc. Anyone who can DM the bot can use them under your tokens. Add a `chatId` allowlist before exposing publicly.
 - **Cost ceiling.** Each Telegram message can fan out into several LLM calls plus tool calls. There's no per-chat budget; rate-limit before opening it up.
 - **Inline queries** still return a static article — they're handled outside the agent path because the latency budget is too tight for an LLM round-trip.
