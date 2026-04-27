@@ -40,7 +40,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 Switch providers by changing those three values. For an OpenAI-compatible gateway (Requesty, LiteLLM, ...) also set `LLM_BASE_URL` and `LLM_API_KEY`.
 
-The bot's persona lives in `prompts/SYSTEM.md` — edit that file (no rebuild needed if you mount it as a volume) and restart.
+The bot's persona lives in `prompts/SYSTEM.md` and a tools manifest lives in `prompts/TOOLS.md` — edit either file (no rebuild needed if you mount `prompts/` as a volume). Changes land at the next new chat session: `SYSTEM.md` and `TOOLS.md` are concatenated (separated by `---`) and read fresh from disk every time a new pi-mono session is spawned, including for staff sub-agents. Existing cached chat sessions keep their original prompt until the bot restarts.
 
 ## Tools
 
@@ -66,6 +66,7 @@ Each tool auto-enables when its prerequisite env var is set; otherwise it's sile
 
 ```
 System prompt loaded from /app/prompts/SYSTEM.md (250 chars).
+Tools manifest loaded from /app/prompts/TOOLS.md (3142 chars); appended to system prompt at session start.
 pi-mono ready (provider=anthropic, model=claude-3-5-sonnet-20241022)
 pi-mono custom tools enabled: web_fetch, github_search_repos, ...
 [pi:<chatId>] session ready, active tools (N): read, write, edit, web_fetch, ...
@@ -105,7 +106,7 @@ If `MESSENGER_INBOUND_TOKEN` is set, the route requires `Authorization: Bearer <
 - **Cost ceiling.** Each Telegram message can fan out into several LLM calls plus tool calls. There's no per-chat budget; rate-limit before opening it up.
 - **Inline queries** still return a static article — they're handled outside the agent path because the latency budget is too tight for an LLM round-trip.
 - **DevBoxer auth** (`devboxer auth`) is browser-based; in Docker, install the CLI in your image and mount the operator's `~/.devboxer` as a volume.
-- **`prompts/SYSTEM.md` is required.** The bot exits 1 if it's missing or empty — by design, so misconfiguration is loud.
+- **`prompts/SYSTEM.md` is required.** The bot exits 1 if it's missing or empty — by design, so misconfiguration is loud. `prompts/TOOLS.md` is optional; missing is logged once and ignored.
 
 ## License
 

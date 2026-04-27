@@ -68,6 +68,7 @@ const llmBaseUrl = process.env.LLM_BASE_URL;
 const llmApiKey = process.env.LLM_API_KEY;
 const workspaceRoot = resolvePath(process.env.WORKSPACE_ROOT ?? "./data/workspaces");
 const systemPromptPath = resolvePath(process.env.SYSTEM_PROMPT_PATH ?? "./prompts/SYSTEM.md");
+const toolsPromptPath = resolvePath(process.env.TOOLS_PROMPT_PATH ?? "./prompts/TOOLS.md");
 const missionsApiUrl = process.env.MISSIONS_API_URL?.trim();
 const messengerInboundToken = process.env.MESSENGER_INBOUND_TOKEN?.trim();
 const defaultTelegramChatIdRaw = process.env.DEFAULT_TELEGRAM_CHAT_ID?.trim();
@@ -75,9 +76,12 @@ const defaultTelegramChatId =
   defaultTelegramChatIdRaw && /^-?\d+$/.test(defaultTelegramChatIdRaw)
     ? Number(defaultTelegramChatIdRaw)
     : undefined;
-let piSystemPrompt = "";
 
-async function loadSystemPrompt(): Promise<void> {
+// Logged once per process so a missing TOOLS.md doesn't spam the log on every
+// session creation. Cleared only by restart.
+let toolsManifestMissingWarned = false;
+
+async function readSystemPromptFile(): Promise<string> {
   let contents: string;
   try {
     contents = await readFile(systemPromptPath, "utf8");
@@ -94,8 +98,69 @@ async function loadSystemPrompt(): Promise<void> {
   if (!trimmed) {
     throw new Error(`System prompt at ${systemPromptPath} is empty.`);
   }
-  piSystemPrompt = trimmed;
-  console.log(`System prompt loaded from ${systemPromptPath} (${trimmed.length} chars).`);
+  return trimmed;
+}
+
+/**
+ * Read the optional tools manifest. Missing file is not fatal — the manifest
+ * is meant to enrich the LLM's context with operational guidance, but the
+ * pi-mono tool registry already exposes each tool's name + schema regardless.
+ */
+async function readToolsManifestFile(): Promise<string> {
+  try {
+    const contents = await readFile(toolsPromptPath, "utf8");
+    return contents.trim();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      if (!toolsManifestMissingWarned) {
+        console.log(
+          `Tools manifest not found at ${toolsPromptPath}; agent will run without tools manifest.`
+        );
+        toolsManifestMissingWarned = true;
+      }
+      return "";
+    }
+    throw new Error(
+      `Failed to read tools manifest from ${toolsPromptPath}: ${(error as Error).message}`
+    );
+  }
+}
+
+/**
+ * Compose the full system prompt fed to a fresh agent session. Reads both
+ * SYSTEM.md and TOOLS.md from disk on every call so operator edits to either
+ * file take effect at the next chat session start without rebuild/restart.
+ */
+async function composeAgentSystemPrompt(): Promise<{
+  prompt: string;
+  systemPart: string;
+  toolsPart: string;
+}> {
+  const [systemPart, toolsPart] = await Promise.all([
+    readSystemPromptFile(),
+    readToolsManifestFile()
+  ]);
+  const prompt = toolsPart
+    ? `${systemPart}\n\n---\n\n${toolsPart}`
+    : systemPart;
+  return { prompt, systemPart, toolsPart };
+}
+
+/**
+ * Startup validation: makes sure SYSTEM.md exists and is non-empty before
+ * any chat traffic arrives, and surfaces a one-time log line for TOOLS.md.
+ */
+async function validateAgentPrompts(): Promise<void> {
+  const { systemPart, toolsPart } = await composeAgentSystemPrompt();
+  console.log(
+    `System prompt loaded from ${systemPromptPath} (${systemPart.length} chars).`
+  );
+  if (toolsPart) {
+    console.log(
+      `Tools manifest loaded from ${toolsPromptPath} (${toolsPart.length} chars); appended to system prompt at session start.`
+    );
+  }
 }
 
 let nextTelegramUpdateId = 0;
@@ -107,7 +172,9 @@ let piAuthStorage: AuthStorage | undefined;
 let piModelRegistry: ModelRegistry | undefined;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let piModel: Model<any> | undefined;
-let piResourceLoader: DefaultResourceLoader | undefined;
+// Resource loaders are constructed per chat in getOrCreatePiSession so the
+// composed system prompt (SYSTEM.md + TOOLS.md) is read fresh from disk for
+// each new session. There is intentionally no shared piResourceLoader.
 let piCustomTools: ToolDefinition[] = [];
 // Custom tools the staff sub-agent inherits. Excludes the staff_* tools
 // (no recursion) but includes everything else, so a travel-agent staff
@@ -386,12 +453,14 @@ async function processMessengerDispatch(payload: MessengerDispatchPayload): Prom
       return;
     }
     try {
+      const toolsManifest = await readToolsManifestFile();
       const result = await runStaffSession(payload.staff, summary, {
         model: piModel,
         authStorage: piAuthStorage!,
         modelRegistry: piModelRegistry!,
         staffTools: piStaffSubagentTools,
-        workspaceRoot
+        workspaceRoot,
+        toolsManifest
       });
       await deliverAutonomousMessage(
         `[${result.staff.name} (${result.staff.area_of_focus})]\n${result.text}`
@@ -538,12 +607,8 @@ async function initializePiMono(): Promise<void> {
   }
 
   piModel = model;
-  piResourceLoader = new DefaultResourceLoader({
-    cwd: process.cwd(),
-    agentDir: getAgentDir(),
-    systemPrompt: piSystemPrompt
-  });
-  await piResourceLoader.reload();
+  // Resource loader (and therefore the composed system prompt) is built fresh
+  // per chat session in getOrCreatePiSession.
 
   if (missionsApiUrl) {
     missionsClient = new MissionsClient(missionsApiUrl);
@@ -567,12 +632,14 @@ async function initializePiMono(): Promise<void> {
 
   const staffDelegateRunner = piModel
     ? async (staff: Staff, request: string): Promise<string> => {
+        const toolsManifest = await readToolsManifestFile();
         const result = await runStaffSession(staff, request, {
           model: piModel!,
           authStorage: piAuthStorage!,
           modelRegistry: piModelRegistry!,
           staffTools: piStaffSubagentTools,
-          workspaceRoot
+          workspaceRoot,
+          toolsManifest
         });
         return result.text;
       }
@@ -599,7 +666,7 @@ async function initializePiMono(): Promise<void> {
 }
 
 async function getOrCreatePiSession(chatId: number): Promise<AgentSession | undefined> {
-  if (!piModel || !piAuthStorage || !piModelRegistry || !piResourceLoader) {
+  if (!piModel || !piAuthStorage || !piModelRegistry) {
     return undefined;
   }
 
@@ -607,6 +674,17 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
   if (!session) {
     const chatWorkspace = resolvePath(workspaceRoot, String(chatId));
     await mkdir(chatWorkspace, { recursive: true });
+
+    // Compose SYSTEM.md + TOOLS.md fresh from disk so operator edits land at
+    // the next new-chat session without bot restart. Existing cached sessions
+    // keep their prompt; clear piSessions or restart to refresh those.
+    const composed = await composeAgentSystemPrompt();
+    const chatResourceLoader = new DefaultResourceLoader({
+      cwd: chatWorkspace,
+      agentDir: getAgentDir(),
+      systemPrompt: composed.prompt
+    });
+    await chatResourceLoader.reload();
 
     const chatCustomTools = [...piCustomTools, ...createImageTools(chatId)];
     // pi-mono treats `tools` as an allowlist that ALSO filters customTools.
@@ -623,7 +701,7 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
       model: piModel,
       authStorage: piAuthStorage,
       modelRegistry: piModelRegistry,
-      resourceLoader: piResourceLoader,
+      resourceLoader: chatResourceLoader,
       sessionManager: SessionManager.inMemory(),
       settingsManager: SettingsManager.inMemory(),
       customTools: chatCustomTools,
@@ -706,7 +784,7 @@ function chunkTelegramMessage(text: string): string[] {
 server.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
   void mkdir(workspaceRoot, { recursive: true })
-    .then(() => loadSystemPrompt())
+    .then(() => validateAgentPrompts())
     .then(() => initializePiMono())
     .then(() => {
       void startTelegramLongPolling();

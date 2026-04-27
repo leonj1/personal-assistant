@@ -44,6 +44,12 @@ export type StaffSessionDeps = {
    * `${workspaceRoot}/staff/${staff.id}/`.
    */
   workspaceRoot: string;
+  /**
+   * Optional tools manifest text (typically the contents of TOOLS.md)
+   * appended to the staff's composed system prompt so the sub-agent shares
+   * the same operational guidance as the main bot session.
+   */
+  toolsManifest?: string;
 };
 
 export type StaffSessionResult = {
@@ -66,7 +72,7 @@ export async function runStaffSession(
   request: string,
   deps: StaffSessionDeps
 ): Promise<StaffSessionResult> {
-  const systemPrompt = composeStaffSystemPrompt(staff);
+  const systemPrompt = composeStaffSystemPrompt(staff, deps.toolsManifest);
 
   const workspace = resolvePath(deps.workspaceRoot, "staff", staff.id);
   await mkdir(workspace, { recursive: true });
@@ -117,7 +123,7 @@ export async function runStaffSession(
  * standing instruction to break complex requests into project + tasks
  * via the mission tools when appropriate.
  */
-export function composeStaffSystemPrompt(staff: Staff): string {
+export function composeStaffSystemPrompt(staff: Staff, toolsManifest?: string): string {
   const persisted = (staff.system_prompt ?? "").trim();
   if (!persisted) {
     throw new Error(
@@ -138,5 +144,7 @@ export function composeStaffSystemPrompt(staff: Staff): string {
     `\n` +
     `--- Persona-specific instructions ---\n`;
 
-  return `${preamble}${persisted}`;
+  const base = `${preamble}${persisted}`;
+  const manifest = (toolsManifest ?? "").trim();
+  return manifest ? `${base}\n\n---\n\n${manifest}` : base;
 }
