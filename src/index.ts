@@ -21,7 +21,10 @@ import { createDevboxerTools } from "./tools/devboxer.js";
 import { createMissionTools } from "./tools/missions.js";
 import { createSecretTools } from "./tools/secrets.js";
 import { createStaffTools } from "./tools/staff.js";
+import { createScheduleTools } from "./tools/schedules.js";
+import { createEmailTools } from "./tools/email.js";
 import { MissionsClient, type Staff } from "./missions.js";
+import { NotesClient } from "./notes.js";
 import { runStaffSession } from "./staffSession.js";
 import type { Api, Model } from "@mariozechner/pi-ai";
 
@@ -71,7 +74,9 @@ const workspaceRoot = resolvePath(process.env.WORKSPACE_ROOT ?? "./data/workspac
 const systemPromptPath = resolvePath(process.env.SYSTEM_PROMPT_PATH ?? "./prompts/SYSTEM.md");
 const toolsPromptPath = resolvePath(process.env.TOOLS_PROMPT_PATH ?? "./prompts/TOOLS.md");
 const missionsApiUrl = process.env.MISSIONS_API_URL?.trim();
+const notesApiUrl = process.env.NOTES_API_URL?.trim();
 const messengerInboundToken = process.env.MESSENGER_INBOUND_TOKEN?.trim();
+const schedulerTriggerToken = process.env.SCHEDULER_TRIGGER_TOKEN?.trim();
 const defaultTelegramChatIdRaw = process.env.DEFAULT_TELEGRAM_CHAT_ID?.trim();
 const defaultTelegramChatId =
   defaultTelegramChatIdRaw && /^-?\d+$/.test(defaultTelegramChatIdRaw)
@@ -182,6 +187,7 @@ let piCustomTools: ToolDefinition[] = [];
 // can call web_search/flight_search/mission_create_task etc.
 let piStaffSubagentTools: ToolDefinition[] = [];
 let missionsClient: MissionsClient | undefined;
+let notesClient: NotesClient | undefined;
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -349,6 +355,11 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (method === "POST" && parsedUrl.pathname === "/scheduler/trigger") {
+      await handleSchedulerTrigger(request, response);
+      return;
+    }
+
     sendJson(response, 404, { error: "Not Found" });
   } catch (error) {
     console.error("Request handling failed", error);
@@ -500,6 +511,134 @@ async function processMessengerDispatch(payload: MessengerDispatchPayload): Prom
   }
 }
 
+// ---- Scheduler trigger inbound (from notes scheduler) ----
+//
+// The notes service runs a script on a cron, which POSTs here to wake the
+// bot. Two flows are supported:
+//   1. With staff_id: instantiate that staff member with the given request
+//      and post the result to DEFAULT_TELEGRAM_CHAT_ID. Used for "every
+//      morning a staff member checks X" workflows.
+//   2. Without staff_id: feed the request to the user's main chat session
+//      so the LLM can decide whether to mint a staff member or handle
+//      the request directly. Behaves like a synthetic user message.
+
+type SchedulerTriggerPayload = {
+  // Human-readable description of why this fired (logged + included in
+  // the LLM prompt). Recommended.
+  description?: string;
+  // If set, the bot wakes that specific staff member. Looked up via the
+  // missions client. If the staff doesn't exist, the request falls back
+  // to the main chat session like flow #2 above.
+  staff_id?: string;
+  // The request to hand to the staff (or the main chat). Required.
+  request?: string;
+  // Optional schedule id, logged so audits can correlate.
+  schedule_id?: string;
+};
+
+function authorizeSchedulerTrigger(request: IncomingMessage): boolean {
+  if (!schedulerTriggerToken) return true;
+  const header = request.headers.authorization ?? "";
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match !== null && match[1].trim() === schedulerTriggerToken;
+}
+
+async function handleSchedulerTrigger(
+  request: IncomingMessage,
+  response: ServerResponse
+): Promise<void> {
+  if (!authorizeSchedulerTrigger(request)) {
+    sendJson(response, 401, { error: "Unauthorized" });
+    return;
+  }
+
+  let payload: SchedulerTriggerPayload;
+  try {
+    payload = (await readJsonBody(request)) as SchedulerTriggerPayload;
+  } catch (error) {
+    sendJson(response, 400, { error: `Invalid JSON: ${(error as Error).message}` });
+    return;
+  }
+
+  const requestText = payload.request?.trim();
+  if (!requestText) {
+    sendJson(response, 400, { error: "request is required" });
+    return;
+  }
+
+  console.log("Scheduler trigger received", {
+    schedule_id: payload.schedule_id,
+    staff_id: payload.staff_id,
+    description: payload.description
+  });
+
+  sendJson(response, 202, { accepted: true });
+
+  void processSchedulerTrigger(payload, requestText).catch((error) => {
+    console.error("Scheduler trigger processing failed", error);
+  });
+}
+
+async function processSchedulerTrigger(
+  payload: SchedulerTriggerPayload,
+  requestText: string
+): Promise<void> {
+  const header = payload.description
+    ? `Scheduled trigger: ${payload.description}`
+    : "Scheduled trigger";
+
+  // Flow #1: explicit staff_id -> ephemeral staff session, post result.
+  if (payload.staff_id && missionsClient && piModel) {
+    try {
+      const staff = await missionsClient.getStaff(payload.staff_id);
+      const toolsManifest = await readToolsManifestFile();
+      const result = await runStaffSession(staff, requestText, {
+        model: piModel,
+        authStorage: piAuthStorage!,
+        modelRegistry: piModelRegistry!,
+        staffTools: piStaffSubagentTools,
+        workspaceRoot,
+        toolsManifest
+      });
+      await deliverAutonomousMessage(
+        `[${result.staff.name} (${result.staff.area_of_focus})] ${header}\n${result.text}`
+      );
+      return;
+    } catch (error) {
+      console.error("Scheduler staff session failed; falling back to main chat", error);
+      // Fall through to flow #2.
+    }
+  }
+
+  // Flow #2: synthesize a user message into the main chat session.
+  if (defaultTelegramChatId === undefined) {
+    console.warn(
+      "Scheduler trigger received but DEFAULT_TELEGRAM_CHAT_ID is not set; dropping.",
+      { schedule_id: payload.schedule_id }
+    );
+    return;
+  }
+
+  const synthesized =
+    `${header}\n\n` +
+    `(This message was generated by the notes scheduler, not by the user. Decide ` +
+    `whether to delegate to an existing staff member, mint a new one, or handle ` +
+    `directly. Respond as you normally would for a request of this shape.)\n\n` +
+    `Request: ${requestText}`;
+
+  try {
+    const reply = await generateAssistantReply(defaultTelegramChatId, synthesized);
+    for (const chunk of chunkTelegramMessage(reply)) {
+      await callTelegramApi("sendMessage", {
+        chat_id: defaultTelegramChatId,
+        text: chunk
+      });
+    }
+  } catch (error) {
+    console.error("Scheduler trigger main-chat reply failed", error);
+  }
+}
+
 function describeEvent(payload: MessengerDispatchPayload): string {
   const event = payload.event!;
   const lines: string[] = [];
@@ -618,6 +757,13 @@ async function initializePiMono(): Promise<void> {
     console.log("MISSIONS_API_URL not set; staff_* and mission_* tools disabled.");
   }
 
+  if (notesApiUrl) {
+    notesClient = new NotesClient(notesApiUrl);
+    console.log(`Notes API client configured: ${notesApiUrl}`);
+  } else {
+    console.log("NOTES_API_URL not set; schedule_* tools disabled.");
+  }
+
   // Tools the staff sub-agent gets when delegated to. Built first so the
   // staff_delegate runner closes over a stable list without seeing its
   // own staff_* tools (would cause delegation recursion).
@@ -629,7 +775,9 @@ async function initializePiMono(): Promise<void> {
     ...createTravelTools(),
     ...createDevboxerTools(),
     ...createMissionTools(missionsClient),
-    ...createSecretTools(missionsClient)
+    ...createSecretTools(missionsClient),
+    ...createScheduleTools(notesClient),
+    ...createEmailTools()
   ];
 
   const staffDelegateRunner = piModel

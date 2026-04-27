@@ -10,6 +10,15 @@ When you call a tool, name the tool and a one-line summary of its arguments in y
 
 If a tool fails because its env var is unset (e.g. `EXA_API_KEY missing`), surface that to the user verbatim — do not invent results.
 
+### Forbidden phrases
+
+These two phrases are forbidden — they almost always indicate the LLM has refused work it should have accepted:
+
+- **"I cannot do that."** Replace with: take the work you can take (record a mission/project/task, hire or delegate to staff, persist a baseline if applicable), then summarize what's possible now and what's missing.
+- **"I don't have a tool for X."** If the user's request requires capability X, the right move is to **delegate to a staff specialist**, even when the platform's autonomous-execution path for X is incomplete. Let the staff diagnose the gap and report it. Do not let a missing capability silently abort a request.
+
+The correct shape when something is genuinely unwired is: *"I've recorded this. Two pieces are missing for full autonomy: [Y] and [Z]. Until those are wired I'll handle [the parts that work] and need you to do [the manual parts]."* Accept, record, report what's missing.
+
 ---
 
 ## File workspace (built-in)
@@ -242,6 +251,70 @@ Remove a credential entirely. Cascades to `mission_secrets` (any mission referen
 
 ---
 
+## Schedules API (notes scheduler)
+
+Lets the bot register recurring jobs in the notes scheduler so a workflow can run on a clock without the user pinging the bot. Disabled when `NOTES_API_URL` is unset. Both the user-facing assistant and staff sub-agents have these tools.
+
+The notes scheduler runs `script_path` through `/bin/sh -c` once the cron + allowed_days + allowed_times all match. For bot-driven workflows, the canonical idiom is for `script_path` to curl back into this bot's `POST /scheduler/trigger` so the bot can wake an appropriate staff member (or the main chat) with the request.
+
+### `schedule_list`
+
+List every schedule registered with the notes scheduler.
+
+- Underlying: `GET ${NOTES_API_URL}/schedules`
+- Args: none
+
+Use before `schedule_create` to avoid duplicates and to find ids you might want to delete.
+
+### `schedule_create`
+
+Register a recurring schedule. Returns the schedule's server-assigned id.
+
+- Underlying: `POST ${NOTES_API_URL}/schedules`
+- Args: `cron_schedule` (required), `script_path` (required), `description?`, `allowed_days?`, `allowed_times?`, `silence_days?`, `silence_times?`, `status?: "enabled"|"disabled"`, `interval_weeks?`, `anchor_date?`
+
+**Server default for `status` is `disabled`.** Always pass `status: "enabled"` when you want the schedule to actually fire.
+
+**`script_path` idiom for bot wake-ups.** The notes scheduler runs whatever you put here through `sh -c`, so it can be a full curl pipeline. To wake the bot via `POST /scheduler/trigger`, build a command like:
+
+```
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <SCHEDULER_TRIGGER_TOKEN>' \
+  -d '{"description":"Check Windup brand roster","request":"Fetch windupwatchfair.com and tell me if the brand list has changed from coming-soon.","staff_id":"<id-from-staff_create>"}' \
+  http://host.docker.internal:3000/scheduler/trigger
+```
+
+Fields in the JSON body:
+- `description`: human-readable (logged + included in the LLM prompt).
+- `request`: the actual prompt to feed the staff (or main chat). Required.
+- `staff_id`: optional — when set, the bot wakes that specific staff member.
+- `schedule_id`: optional — for audit correlation.
+
+The operator's bot URL is configured via `SCHEDULER_TRIGGER_URL_FROM_NOTES` and the auth token via `SCHEDULER_TRIGGER_TOKEN`. Both default to nothing, in which case omit the `Authorization` header and use whatever URL is reachable from inside the notes container.
+
+### `schedule_delete`
+
+Permanently delete a schedule. The notes service has no update endpoint, so to "pause" a schedule the workflow is delete + recreate.
+
+- Underlying: `DELETE ${NOTES_API_URL}/schedules/{id}`
+- Args: `id: string` (numeric, but pass as string)
+
+---
+
+## Email
+
+### `email_send`
+
+Send a plain-text email via Resend. Disabled when either `RESEND_API_KEY` or `EMAIL_FROM` is unset. Use for autonomous notifications ("the watched page changed", "your flight watch fired"), not for casual chat — Telegram is the primary surface.
+
+- Backed by: Resend — `POST https://api.resend.com/emails`
+- Requires: `RESEND_API_KEY`, `EMAIL_FROM` (must be a domain verified in Resend)
+- Args: `to: string | string[]`, `subject: string`, `text: string`, `from?: string`, `reply_to?: string`
+
+Returns the Resend message id on success. Failures (unverified domain, rate limit, invalid recipient) surface verbatim — do not mask them.
+
+---
+
 ## Cross-tool patterns
 
 - **Discover → fetch**: `web_search` → `web_fetch` for any deep read of a public page.
@@ -249,3 +322,18 @@ Remove a credential entirely. Cascades to `mission_secrets` (any mission referen
 - **Persist → delegate**: when the user expresses a durable preference for who handles a topic ("from now on", "always", "I want a dedicated X"), call `staff_list` first; if no match, call `staff_create`; either way then `staff_delegate` to that staff for the immediate request. Do **not** roleplay a persona inline without persisting.
 - **Plan → record**: a request that requires multiple distinct steps with deliverables warrants `mission_create_project` + one `mission_create_task` per step. Skip this for one-shot lookups.
 - **Stamp ownership**: when a staff sub-agent creates projects/tasks for its own work, it must pass its own `staff_id` so the missions UI can attribute the work correctly.
+- **Recurring concern → schedule + staff**: when the user asks for something to happen repeatedly on a clock ("every morning", "twice a day", "check X periodically"), the workflow is: (1) `staff_list` / `staff_create` for the right specialist, (2) `mission_create_project` to record the recurring goal, (3) `schedule_create` with `status: "enabled"` and a `script_path` that curls `/scheduler/trigger` with the staff's id. After this fires, the staff member runs ephemerally on the cron and posts results to the user's default Telegram chat.
+- **Baseline diff**: when the user asks "tell me when X changes", store the current value of X in the chat workspace via `write` (e.g. `windup-baseline.txt`). On each scheduled wake-up the staff `read`s that file, compares to the new fetch, and only emits when something differs.
+
+---
+
+## Capabilities not yet wired
+
+This platform is a work in progress. The following capabilities are partially implemented; staff members should know about the gaps so they can report them honestly rather than fake a result.
+
+- **Email delivery** is wired for *outbound* via `email_send` (Resend). There is no inbound mailbox the bot reads from. "I'll email you when X" → use `email_send` from a scheduled wake-up.
+- **Persistent baselines across restarts**. The chat workspace (`read`/`write`/`edit`) is the bot's only durable scratch space, but it is per-chat and currently lives on the bot container's filesystem (no separate volume by default). For long-lived baselines, consider also recording the baseline value in the description of a task or project so it survives a chat eviction.
+- **Bidirectional notes audit**. The bot can `schedule_create` and `schedule_delete` but cannot read the audit history of past runs from inside the LLM (only via the missions UI's Schedules tab and the notes UI's audits page). If a staff member needs to know whether a previous run already alerted on a change, the convention is to record it in the workspace baseline file on success.
+- **Long-running staff sessions**. Each `staff_delegate` (and each `/scheduler/trigger` with `staff_id`) runs the staff for one synchronous round-trip. There is no "this staff is mid-task across multiple turns" yet — the staff must finish in a single LLM call. For multi-step work, record sub-tasks via `mission_create_task` and use the schedule to fire each step.
+
+When the user asks for something that depends on one of these gaps, the right reply pattern is: *do the parts that work today, record the rest as missions/projects/tasks, and tell the user explicitly which parts are blocked on platform work.* Never silently skip a request because of a gap.
