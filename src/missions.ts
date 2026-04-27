@@ -46,6 +46,35 @@ export type Staff = {
   updated_at: string;
 };
 
+export type Secret = {
+  name: string;
+  value: string;
+  created_at: string;
+};
+
+// Server-side shape returned by GET /secrets. The bot's `secret_list` tool
+// intentionally drops the `value` field before handing the result to the
+// LLM; this type lives here so the HTTP client itself can stay typed end
+// to end.
+export type SecretListResult = {
+  items: Secret[];
+  total: number;
+};
+
+export type CreateSecretInput = {
+  name: string;
+  value: string;
+};
+
+export type UpdateSecretInput = {
+  value: string;
+};
+
+export type ListSecretsFilter = {
+  limit?: number;
+  offset?: number;
+};
+
 export type CreateStaffInput = {
   name: string;
   area_of_focus: string;
@@ -161,6 +190,51 @@ export class MissionsClient {
 
   listTasks(filter: ListTasksFilter = {}, signal?: AbortSignal): Promise<Task[]> {
     return this.request<Task[]>("GET", `/tasks${this.qs(filter)}`, undefined, signal);
+  }
+
+  // ---- Secrets ----
+
+  /**
+   * List secrets. Returns the raw {items, total} envelope from the missions
+   * API, including each secret's `value`. The bot's `secret_list` tool is
+   * responsible for stripping `value` before handing rows to the LLM.
+   */
+  listSecrets(filter: ListSecretsFilter = {}, signal?: AbortSignal): Promise<SecretListResult> {
+    const params: Record<string, string | undefined> = {
+      limit: filter.limit !== undefined ? String(filter.limit) : undefined,
+      offset: filter.offset !== undefined ? String(filter.offset) : undefined
+    };
+    return this.request<SecretListResult>("GET", `/secrets${this.qs(params)}`, undefined, signal);
+  }
+
+  getSecret(name: string, signal?: AbortSignal): Promise<Secret> {
+    return this.request<Secret>("GET", `/secrets/${encodeURIComponent(name)}`, undefined, signal);
+  }
+
+  createSecret(input: CreateSecretInput, signal?: AbortSignal): Promise<Secret> {
+    return this.request<Secret>("POST", "/secrets", input, signal);
+  }
+
+  updateSecret(
+    name: string,
+    input: UpdateSecretInput,
+    signal?: AbortSignal
+  ): Promise<Secret> {
+    return this.request<Secret>(
+      "PUT",
+      `/secrets/${encodeURIComponent(name)}`,
+      input,
+      signal
+    );
+  }
+
+  deleteSecret(name: string, signal?: AbortSignal): Promise<void> {
+    return this.request<void>(
+      "DELETE",
+      `/secrets/${encodeURIComponent(name)}`,
+      undefined,
+      signal
+    );
   }
 
   // ---- internals ----

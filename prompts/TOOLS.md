@@ -197,9 +197,55 @@ Hand a request to a staff member. The staff is instantiated on-demand using its 
 
 ---
 
+## Secrets API
+
+Manages credentials (API keys, tokens) stored in the missions secrets table. All four tools talk to `${MISSIONS_API_URL}/secrets` and are disabled when `MISSIONS_API_URL` is unset. Both the user-facing assistant and staff sub-agents have these tools.
+
+**Security contract**: there is intentionally **no `secret_get` tool** — secret values never flow back through any LLM-facing read path. `secret_list` returns names + timestamps only. Treat secret values as write-once from the LLM's perspective: the bot can store them, but cannot read them back.
+
+When a tool you (or a staff member) want to use is missing a credential — for example `flight_search` requires `SERPAPI_API_KEY`, `web_search` requires `EXA_API_KEY` — the workflow is:
+
+1. Call `secret_list` to see whether the user has already provided that name.
+2. If absent, ask the user for the value in plain language: *"To run flight searches I need a SerpAPI key. Could you paste it here? It will be stored under the name SERPAPI_API_KEY."*
+3. When the user replies with the value, call `secret_create` (or `secret_update` if it already existed).
+4. Acknowledge by name only — do not echo the value.
+
+Note: writing a secret puts the value into the LLM's context for that single tool call (because pi-mono passes tool args verbatim to the model). That is unavoidable for any LLM-driven write path. For long-lived operator credentials the missions UI's Secrets tab or a direct `curl POST /secrets` is preferable.
+
+### `secret_list`
+
+List the names (and creation timestamps) of secrets currently stored. Values are stripped before the result reaches the LLM.
+
+- Underlying: `GET ${MISSIONS_API_URL}/secrets?limit=&offset=`
+- Args: `limit?: 1–200 (default 50)`, `offset?: ≥0`
+
+### `secret_create`
+
+Persist a new credential. Fails if the name already exists; call `secret_update` in that case.
+
+- Underlying: `POST ${MISSIONS_API_URL}/secrets`
+- Args: `name: string` (conventionally uppercase + underscores, e.g. `EXA_API_KEY`), `value: string`
+
+### `secret_update`
+
+Overwrite the value of an existing credential. Previous value is not recoverable.
+
+- Underlying: `PUT ${MISSIONS_API_URL}/secrets/{name}`
+- Args: `name: string`, `value: string`
+
+### `secret_delete`
+
+Remove a credential entirely. Cascades to `mission_secrets` (any mission referencing this name will see it disappear from its `secrets` array).
+
+- Underlying: `DELETE ${MISSIONS_API_URL}/secrets/{name}`
+- Args: `name: string`
+
+---
+
 ## Cross-tool patterns
 
 - **Discover → fetch**: `web_search` → `web_fetch` for any deep read of a public page.
+- **Check creds → ask → store**: when about to call a tool that needs a credential the bot doesn't already have (e.g. delegating to a travel-agent that needs `SERPAPI_API_KEY`), call `secret_list` first; if the credential is missing, ask the user in plain language and then `secret_create` the value they provide. Never invent or guess a credential value.
 - **Persist → delegate**: when the user expresses a durable preference for who handles a topic ("from now on", "always", "I want a dedicated X"), call `staff_list` first; if no match, call `staff_create`; either way then `staff_delegate` to that staff for the immediate request. Do **not** roleplay a persona inline without persisting.
 - **Plan → record**: a request that requires multiple distinct steps with deliverables warrants `mission_create_project` + one `mission_create_task` per step. Skip this for one-shot lookups.
 - **Stamp ownership**: when a staff sub-agent creates projects/tasks for its own work, it must pass its own `staff_id` so the missions UI can attribute the work correctly.

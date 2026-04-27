@@ -19,6 +19,7 @@ import { createRailwayTools } from "./tools/railway.js";
 import { createTravelTools } from "./tools/travel.js";
 import { createDevboxerTools } from "./tools/devboxer.js";
 import { createMissionTools } from "./tools/missions.js";
+import { createSecretTools } from "./tools/secrets.js";
 import { createStaffTools } from "./tools/staff.js";
 import { MissionsClient, type Staff } from "./missions.js";
 import { runStaffSession } from "./staffSession.js";
@@ -627,7 +628,8 @@ async function initializePiMono(): Promise<void> {
     ...createRailwayTools(),
     ...createTravelTools(),
     ...createDevboxerTools(),
-    ...createMissionTools(missionsClient)
+    ...createMissionTools(missionsClient),
+    ...createSecretTools(missionsClient)
   ];
 
   const staffDelegateRunner = piModel
