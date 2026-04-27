@@ -74,6 +74,42 @@ pi-mono custom tools enabled: web_fetch, github_search_repos, ...
 
 The first `pi-mono custom tools enabled` line lists what was registered globally; the per-session `active tools` line is the **actual** list reaching the LLM (these used to differ — see `cdcceaf`).
 
+## Local testing without Telegram
+
+The HTTP server exposes `POST /query` so you can drive the same agent path the Telegram handler uses (`generateAssistantReply` -> pi-mono session -> LLM + tools) from your own machine — no bot token, no webhook, no chat round-trip.
+
+```bash
+curl -sS -X POST http://localhost:3213/query \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"find me the weather in tulum mexico"}'
+```
+
+```jsonc
+// 200
+{
+  "reply":  "Here's the complete picture for Tulum, Mexico ...",
+  "chatId": -1
+}
+```
+
+Request body:
+
+| Field    | Type     | Required | Notes |
+|----------|----------|:--------:|-------|
+| `text`   | string   | yes      | Trimmed; must be non-empty. |
+| `chatId` | integer  | no       | Defaults to `-1` (a sentinel local-test session). Reuse the same value to keep conversation history; pick a different one for an isolated session. |
+
+Status codes:
+
+| Code | When |
+|------|------|
+| `200` | Success — `reply` contains the assistant's text. |
+| `400` | Body is not JSON, `text` is missing/empty, or `chatId` is not a number. |
+| `502` | The agent ran but the LLM/tool call failed. |
+| `503` | `LLM_PROVIDER` / `LLM_MODEL` are not configured (the bot would already be using the static "hello" fallback). |
+
+The endpoint reuses the existing per-chat session map, so subsequent requests with the same `chatId` continue the conversation; this makes it useful for both one-shot smoke tests and multi-turn debugging.
+
 ## Make targets
 
 | Target | What it does |

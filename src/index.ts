@@ -360,6 +360,11 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (method === "POST" && parsedUrl.pathname === "/query") {
+      await handleQueryRequest(request, response);
+      return;
+    }
+
     sendJson(response, 404, { error: "Not Found" });
   } catch (error) {
     console.error("Request handling failed", error);
@@ -693,6 +698,70 @@ async function deliverAutonomousMessage(text: string): Promise<void> {
       chat_id: defaultTelegramChatId,
       text: chunk
     });
+  }
+}
+
+// ---- Local /query endpoint (no Telegram) ----
+//
+// Default chat id used by /query when the caller does not supply one. Negative
+// so it cannot collide with a real Telegram chat id (Telegram chat ids are
+// non-negative integers for users and large negatives for groups; -1 is
+// reserved here as the local-test sentinel).
+const QUERY_DEFAULT_CHAT_ID = -1;
+
+// Request body shape for POST /query. Only `text` is required.
+type QueryRequestBody = {
+  text?: unknown;
+  chatId?: unknown;
+};
+
+// handleQueryRequest is the local-test surface for the assistant: it bypasses
+// Telegram entirely and exercises the same `generateAssistantReply` path the
+// Telegram handler uses. Useful for smoke tests on this machine without
+// configuring TELEGRAM_BOT_TOKEN or proxying webhook traffic.
+async function handleQueryRequest(
+  request: IncomingMessage,
+  response: ServerResponse
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJsonBody(request);
+  } catch (error) {
+    sendJson(response, 400, { error: `invalid JSON body: ${(error as Error).message}` });
+    return;
+  }
+
+  const parsed = body as QueryRequestBody;
+  const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+  if (!text) {
+    sendJson(response, 400, { error: "field 'text' must be a non-empty string" });
+    return;
+  }
+
+  let chatId: number = QUERY_DEFAULT_CHAT_ID;
+  if (typeof parsed.chatId === "number" && Number.isFinite(parsed.chatId)) {
+    chatId = Math.trunc(parsed.chatId);
+  } else if (parsed.chatId !== undefined) {
+    sendJson(response, 400, { error: "field 'chatId' must be a number when provided" });
+    return;
+  }
+
+  if (!piModel) {
+    sendJson(response, 503, {
+      error:
+        "assistant not initialized: set LLM_PROVIDER, LLM_MODEL (and LLM_BASE_URL/LLM_API_KEY for OpenAI-compatible providers) and restart"
+    });
+    return;
+  }
+
+  console.log("Local /query received", { chatId, length: text.length });
+
+  try {
+    const reply = await generateAssistantReply(chatId, text);
+    sendJson(response, 200, { reply, chatId });
+  } catch (error) {
+    console.error("Local /query failed", error);
+    sendJson(response, 502, { error: (error as Error).message });
   }
 }
 
