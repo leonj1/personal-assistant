@@ -31,4 +31,4 @@ EXPOSE 3000
 
 USER node
 
-CMD ["node", "dist/index.js"]
+ENTRYPOINT ["node", "dist/index.js"]

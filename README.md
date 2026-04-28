@@ -12,7 +12,7 @@ Built on [pi-mono](https://github.com/badlogic/pi-mono) (LLM agent runtime) with
 git clone <this-repo> && cd personal-assistant
 cp .env.example .env
 # edit .env: set TELEGRAM_BOT_TOKEN and your LLM_PROVIDER + LLM_MODEL + matching API key
-make start
+make assistant
 ```
 
 Open Telegram, message your bot, get a reply. That's it.
@@ -24,7 +24,7 @@ Logs: `docker logs -f myclaw-app`. Stop: `make stop`.
 ```bash
 npm ci
 npm run build
-node dist/index.js
+node dist/index.js --profile assistant
 ```
 
 ## Configuration
@@ -40,7 +40,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 Switch providers by changing those three values. For an OpenAI-compatible gateway (Requesty, LiteLLM, ...) also set `LLM_BASE_URL` and `LLM_API_KEY`.
 
-The bot's persona lives in `prompts/SYSTEM.md` and a tools manifest lives in `prompts/TOOLS.md` — edit either file (no rebuild needed if you mount `prompts/` as a volume). Changes land at the next new chat session: `SYSTEM.md` and `TOOLS.md` are concatenated (separated by `---`) and read fresh from disk every time a new pi-mono session is spawned, including for staff sub-agents. Existing cached chat sessions keep their original prompt until the bot restarts.
+There is no default prompt profile. You must launch the bot with `--profile assistant` or `--profile staff` (for Docker via `make assistant` or `make staff`). The bot then reads its persona from `prompts/<profile>/SYSTEM.md` and its tools manifest from `prompts/<profile>/TOOLS.md`. Changes land at the next new chat session: `SYSTEM.md` and `TOOLS.md` are concatenated (separated by `---`) and read fresh from disk every time a new pi-mono session is spawned, including for staff sub-agents. Existing cached chat sessions keep their original prompt until the bot restarts.
 
 ## Tools
 
@@ -65,8 +65,9 @@ Each tool auto-enables when its prerequisite env var is set; otherwise it's sile
 ## What the startup logs tell you
 
 ```
-System prompt loaded from /app/prompts/SYSTEM.md (250 chars).
-Tools manifest loaded from /app/prompts/TOOLS.md (3142 chars); appended to system prompt at session start.
+Prompt profile selected: assistant.
+System prompt loaded from /app/prompts/assistant/SYSTEM.md (250 chars).
+Tools manifest loaded from /app/prompts/assistant/TOOLS.md (3142 chars); appended to system prompt at session start.
 pi-mono ready (provider=anthropic, model=claude-3-5-sonnet-20241022)
 pi-mono custom tools enabled: web_fetch, github_search_repos, ...
 [pi:<chatId>] session ready, active tools (N): read, write, edit, web_fetch, ...
@@ -116,8 +117,8 @@ The endpoint reuses the existing per-chat session map, so subsequent requests wi
 |---|---|
 | `make build` | `tsc` → `dist/` (installs deps if needed) |
 | `make image` | `docker build -t myclaw:local .` |
-| `make start` | builds image and runs container `myclaw-app` on port 3213 |
-| `make stop` / `make restart` | obvious |
+| `make assistant` / `make staff` | builds image and (re)starts container `myclaw-app` on port 3213 with the selected prompt profile |
+| `make stop` | stops and removes container `myclaw-app` |
 | `make clean` | removes `dist/` |
 
 ## Staff & autonomous events
@@ -142,7 +143,7 @@ If `MESSENGER_INBOUND_TOKEN` is set, the route requires `Authorization: Bearer <
 - **Cost ceiling.** Each Telegram message can fan out into several LLM calls plus tool calls. There's no per-chat budget; rate-limit before opening it up.
 - **Inline queries** still return a static article — they're handled outside the agent path because the latency budget is too tight for an LLM round-trip.
 - **DevBoxer auth** (`devboxer auth`) is browser-based; in Docker, install the CLI in your image and mount the operator's `~/.devboxer` as a volume.
-- **`prompts/SYSTEM.md` is required.** The bot exits 1 if it's missing or empty — by design, so misconfiguration is loud. `prompts/TOOLS.md` is optional; missing is logged once and ignored.
+- **`prompts/<profile>/SYSTEM.md` is required.** The bot exits 1 if the selected profile's system prompt is missing or empty — by design, so misconfiguration is loud. `prompts/<profile>/TOOLS.md` is optional; missing is logged once and ignored.
 
 ## License
 

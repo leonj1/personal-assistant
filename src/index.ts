@@ -60,6 +60,63 @@ type TelegramApiResponse<Result> = {
   description?: string;
 };
 
+const supportedPromptProfiles = ["assistant", "staff"] as const;
+type PromptProfile = (typeof supportedPromptProfiles)[number];
+
+function exitWithUsage(message?: string, exitCode = 1): never {
+  if (message) {
+    const log = exitCode === 0 ? console.log : console.error;
+    log(message);
+  }
+  console.log("Usage: node dist/index.js --profile assistant|staff");
+  process.exit(exitCode);
+}
+
+function parsePromptProfile(argv: string[]): PromptProfile {
+  let profile: string | undefined;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+
+    if (argument === "--help" || argument === "-h") {
+      exitWithUsage(undefined, 0);
+    }
+
+    if (argument === "--profile") {
+      const next = argv[index + 1];
+      if (!next || next.startsWith("-")) {
+        exitWithUsage("Missing value for --profile.");
+      }
+      profile = next;
+      index += 1;
+      continue;
+    }
+
+    if (argument.startsWith("--profile=")) {
+      const value = argument.slice("--profile=".length).trim();
+      if (!value) {
+        exitWithUsage("Missing value for --profile.");
+      }
+      profile = value;
+      continue;
+    }
+
+    exitWithUsage(`Unknown argument: ${argument}`);
+  }
+
+  if (!profile) {
+    exitWithUsage("Missing required --profile argument.");
+  }
+
+  if (!supportedPromptProfiles.includes(profile as PromptProfile)) {
+    exitWithUsage(
+      `Invalid --profile value "${profile}". Expected one of: ${supportedPromptProfiles.join(", ")}.`
+    );
+  }
+
+  return profile as PromptProfile;
+}
+
 const port = Number(process.env.PORT ?? 3000);
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
 const telegramPollTimeoutSeconds = Number(process.env.TELEGRAM_POLL_TIMEOUT_SECONDS ?? 30);
@@ -71,8 +128,10 @@ const llmModelId = process.env.LLM_MODEL;
 const llmBaseUrl = process.env.LLM_BASE_URL;
 const llmApiKey = process.env.LLM_API_KEY;
 const workspaceRoot = resolvePath(process.env.WORKSPACE_ROOT ?? "./data/workspaces");
-const systemPromptPath = resolvePath(process.env.SYSTEM_PROMPT_PATH ?? "./prompts/SYSTEM.md");
-const toolsPromptPath = resolvePath(process.env.TOOLS_PROMPT_PATH ?? "./prompts/TOOLS.md");
+const promptProfile = parsePromptProfile(process.argv.slice(2));
+const promptProfileRoot = resolvePath("./prompts", promptProfile);
+const systemPromptPath = resolvePath(promptProfileRoot, "SYSTEM.md");
+const toolsPromptPath = resolvePath(promptProfileRoot, "TOOLS.md");
 const missionsApiUrl = process.env.MISSIONS_API_URL?.trim();
 const notesApiUrl = process.env.NOTES_API_URL?.trim();
 const messengerInboundToken = process.env.MESSENGER_INBOUND_TOKEN?.trim();
@@ -94,15 +153,17 @@ async function readSystemPromptFile(): Promise<string> {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
-      throw new Error(`System prompt file not found at ${systemPromptPath}.`);
+      throw new Error(
+        `System prompt file not found for profile ${promptProfile} at ${systemPromptPath}.`
+      );
     }
     throw new Error(
-      `Failed to read system prompt from ${systemPromptPath}: ${(error as Error).message}`
+      `Failed to read system prompt for profile ${promptProfile} from ${systemPromptPath}: ${(error as Error).message}`
     );
   }
   const trimmed = contents.trim();
   if (!trimmed) {
-    throw new Error(`System prompt at ${systemPromptPath} is empty.`);
+    throw new Error(`System prompt for profile ${promptProfile} at ${systemPromptPath} is empty.`);
   }
   return trimmed;
 }
@@ -121,22 +182,23 @@ async function readToolsManifestFile(): Promise<string> {
     if (code === "ENOENT") {
       if (!toolsManifestMissingWarned) {
         console.log(
-          `Tools manifest not found at ${toolsPromptPath}; agent will run without tools manifest.`
+          `Tools manifest not found for profile ${promptProfile} at ${toolsPromptPath}; agent will run without tools manifest.`
         );
         toolsManifestMissingWarned = true;
       }
       return "";
     }
     throw new Error(
-      `Failed to read tools manifest from ${toolsPromptPath}: ${(error as Error).message}`
+      `Failed to read tools manifest for profile ${promptProfile} from ${toolsPromptPath}: ${(error as Error).message}`
     );
   }
 }
 
 /**
  * Compose the full system prompt fed to a fresh agent session. Reads both
- * SYSTEM.md and TOOLS.md from disk on every call so operator edits to either
- * file take effect at the next chat session start without rebuild/restart.
+ * profile-specific SYSTEM.md and TOOLS.md from disk on every call so
+ * operator edits to either file take effect at the next chat session start
+ * without rebuild/restart.
  */
 async function composeAgentSystemPrompt(): Promise<{
   prompt: string;
@@ -154,11 +216,13 @@ async function composeAgentSystemPrompt(): Promise<{
 }
 
 /**
- * Startup validation: makes sure SYSTEM.md exists and is non-empty before
- * any chat traffic arrives, and surfaces a one-time log line for TOOLS.md.
+ * Startup validation: makes sure the selected profile's SYSTEM.md exists and
+ * is non-empty before any chat traffic arrives, and surfaces a one-time log
+ * line for TOOLS.md.
  */
 async function validateAgentPrompts(): Promise<void> {
   const { systemPart, toolsPart } = await composeAgentSystemPrompt();
+  console.log(`Prompt profile selected: ${promptProfile}.`);
   console.log(
     `System prompt loaded from ${systemPromptPath} (${systemPart.length} chars).`
   );
@@ -179,8 +243,8 @@ let piModelRegistry: ModelRegistry | undefined;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let piModel: Model<any> | undefined;
 // Resource loaders are constructed per chat in getOrCreatePiSession so the
-// composed system prompt (SYSTEM.md + TOOLS.md) is read fresh from disk for
-// each new session. There is intentionally no shared piResourceLoader.
+// composed system prompt from the selected profile is read fresh from disk
+// for each new session. There is intentionally no shared piResourceLoader.
 let piCustomTools: ToolDefinition[] = [];
 // Custom tools the staff sub-agent inherits. Excludes the staff_* tools
 // (no recursion) but includes everything else, so a travel-agent staff
@@ -894,9 +958,10 @@ async function getOrCreatePiSession(chatId: number): Promise<AgentSession | unde
     const chatWorkspace = resolvePath(workspaceRoot, String(chatId));
     await mkdir(chatWorkspace, { recursive: true });
 
-    // Compose SYSTEM.md + TOOLS.md fresh from disk so operator edits land at
-    // the next new-chat session without bot restart. Existing cached sessions
-    // keep their prompt; clear piSessions or restart to refresh those.
+    // Compose the selected profile's SYSTEM.md + TOOLS.md fresh from disk so
+    // operator edits land at the next new-chat session without bot restart.
+    // Existing cached sessions keep their prompt; clear piSessions or restart
+    // to refresh those.
     const composed = await composeAgentSystemPrompt();
     const chatResourceLoader = new DefaultResourceLoader({
       cwd: chatWorkspace,

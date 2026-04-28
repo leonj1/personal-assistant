@@ -1,6 +1,6 @@
 # Tools
 
-This document is appended to `prompts/SYSTEM.md` each time the assistant agent is invoked, so it is always part of the LLM's system context. It is the operator's reference for **what tools exist, what they call under the hood, and when each should be used**.
+This document is appended to the selected profile's `SYSTEM.md` each time the assistant agent is invoked, so it is always part of the LLM's system context. It is the operator's reference for **what tools exist, what they call under the hood, and when each should be used**.
 
 The pi-mono tool registry already exposes each tool's name, description, and full parameter JSON schema to the LLM at call time. The list below is intentionally not exhaustive on argument shape — refer to the tool schema for complete parameter details. This file emphasises the things the schema cannot carry: cross-tool patterns, the backing API/CLI, and which environment variables gate availability.
 
