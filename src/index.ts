@@ -83,13 +83,21 @@ function parsePromptProfile(argv: string[]): PromptProfile {
     }
 
     if (argument === "--profile") {
-      profile = argv[index + 1];
+      const next = argv[index + 1];
+      if (!next || next.startsWith("-")) {
+        exitWithUsage("Missing value for --profile.");
+      }
+      profile = next;
       index += 1;
       continue;
     }
 
     if (argument.startsWith("--profile=")) {
-      profile = argument.slice("--profile=".length);
+      const value = argument.slice("--profile=".length).trim();
+      if (!value) {
+        exitWithUsage("Missing value for --profile.");
+      }
+      profile = value;
       continue;
     }
 
