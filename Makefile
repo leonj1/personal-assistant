@@ -2,6 +2,7 @@ IMAGE_NAME ?= myclaw:local
 CONTAINER_NAME ?= myclaw-app
 HOST_PORT ?= 3213
 CONTAINER_PORT ?= 3000
+PROFILE ?=
 ENV_FILE_ARGS := $(if $(wildcard .env),--env-file .env,)
 
 .PHONY: build install image start stop restart clean
@@ -17,11 +18,19 @@ image:
 	docker build -t $(IMAGE_NAME) .
 
 start: image
+	@if [ -z "$(PROFILE)" ]; then \
+		echo "PROFILE is required. Usage: make start PROFILE=assistant"; \
+		exit 1; \
+	fi
+	@if [ "$(PROFILE)" != "assistant" ] && [ "$(PROFILE)" != "staff" ]; then \
+		echo "PROFILE must be assistant or staff."; \
+		exit 1; \
+	fi
 	@if docker ps -aq -f name=^/$(CONTAINER_NAME)$$ | grep -q .; then \
 		echo "Container $(CONTAINER_NAME) already exists. Run 'make restart' or 'make stop' first."; \
 		exit 1; \
 	fi
-	docker run -d --name $(CONTAINER_NAME) -p $(HOST_PORT):$(CONTAINER_PORT) $(ENV_FILE_ARGS) $(IMAGE_NAME)
+	docker run -d --name $(CONTAINER_NAME) -p $(HOST_PORT):$(CONTAINER_PORT) $(ENV_FILE_ARGS) $(IMAGE_NAME) --profile $(PROFILE)
 
 stop:
 	@if docker ps -aq -f name=^/$(CONTAINER_NAME)$$ | grep -q .; then \
