@@ -12,7 +12,7 @@ Built on [pi-mono](https://github.com/badlogic/pi-mono) (LLM agent runtime) with
 git clone <this-repo> && cd personal-assistant
 cp .env.example .env
 # edit .env: set TELEGRAM_BOT_TOKEN and your LLM_PROVIDER + LLM_MODEL + matching API key
-make start PROFILE=assistant
+make assistant
 ```
 
 Open Telegram, message your bot, get a reply. That's it.
@@ -40,7 +40,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 Switch providers by changing those three values. For an OpenAI-compatible gateway (Requesty, LiteLLM, ...) also set `LLM_BASE_URL` and `LLM_API_KEY`.
 
-There is no default prompt profile. You must launch the bot with `--profile assistant` or `--profile staff` (for Docker via `make start PROFILE=assistant` or `make start PROFILE=staff`). The bot then reads its persona from `prompts/<profile>/SYSTEM.md` and its tools manifest from `prompts/<profile>/TOOLS.md`. Changes land at the next new chat session: `SYSTEM.md` and `TOOLS.md` are concatenated (separated by `---`) and read fresh from disk every time a new pi-mono session is spawned, including for staff sub-agents. Existing cached chat sessions keep their original prompt until the bot restarts.
+There is no default prompt profile. You must launch the bot with `--profile assistant` or `--profile staff` (for Docker via `make assistant` or `make staff`). The bot then reads its persona from `prompts/<profile>/SYSTEM.md` and its tools manifest from `prompts/<profile>/TOOLS.md`. Changes land at the next new chat session: `SYSTEM.md` and `TOOLS.md` are concatenated (separated by `---`) and read fresh from disk every time a new pi-mono session is spawned, including for staff sub-agents. Existing cached chat sessions keep their original prompt until the bot restarts.
 
 ## Tools
 
@@ -117,8 +117,8 @@ The endpoint reuses the existing per-chat session map, so subsequent requests wi
 |---|---|
 | `make build` | `tsc` → `dist/` (installs deps if needed) |
 | `make image` | `docker build -t myclaw:local .` |
-| `make start PROFILE=assistant` | builds image and runs container `myclaw-app` on port 3213 with the selected prompt profile |
-| `make stop` / `make restart` | obvious |
+| `make assistant` / `make staff` | builds image and (re)starts container `myclaw-app` on port 3213 with the selected prompt profile |
+| `make stop` | stops and removes container `myclaw-app` |
 | `make clean` | removes `dist/` |
 
 ## Staff & autonomous events
